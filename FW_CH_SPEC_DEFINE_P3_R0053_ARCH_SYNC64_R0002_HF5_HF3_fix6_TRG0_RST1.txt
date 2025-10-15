@@ -1,0 +1,447 @@
+/*
+P3_R0053_ARCH_SYNC64_R0002_HF5_HF3_fix6_TRG0_RST1  (Teensy 4.1 + AD7606 Serial Dual-SDO)
+
+[Minimal Patch Only]
+- TRGSRC = External(0)  // ★ 기존 코드에서 쓰던 TRGSRC 비트 OR 제거
+- TIMRST = 1 (Trigger에서 리셋)  // ★ 이전 RST=0 → 1 로 변경
+[Keep]
+- TIMENA=2 (Level Enable), TIMDIS=2 (Compare에서 Disable), TIMDEC=2 (PIN edge 감소), TIMCMP=0x7F00
+- TRGPOL=1 (Active-Low) → BUSY Low 레벨 동안 Enable
+- PINSEL=11(D9=RD in), TRGSEL=10(D6=BUSY), SHIFTSDEN(bit3)=1, DMAMUX=FlexIO2 Req3
+- 명령/로그/KPI/핀MUX/PWM(공통 마스터) 전체 유지
+*/
+
+#include <Arduino.h>
+#include <math.h>
+#include <string.h>
+#include <ctype.h>
+#include "DMAChannel.h"
+#include "imxrt.h"
+
+#define FLEX_TIMER_MODE 1   // 1: Shifter Clock
+
+#ifndef DMAMUX_SOURCE_FLEXIO2_REQUEST3
+  #ifdef DMAMUX_SOURCE_FLEXIO2_REQUEST0
+    #define DMAMUX_SOURCE_FLEXIO2_REQUEST3 (DMAMUX_SOURCE_FLEXIO2_REQUEST0+3)
+  #else
+    #define DMAMUX_SOURCE_FLEXIO2_REQUEST3 (105) // RT1062 shifter3 (환경별 다를 수 있음)
+  #endif
+#endif
+
+// 일부 코어에서 정의 누락 시 가드
+#ifndef FLEXIO_TIMCTL_TRGSRC
+  #define FLEXIO_TIMCTL_TRGSRC (1u<<22)   // 주의: 이번 패치에서는 사용하지 않음(=0이 External)
+#endif
+#ifndef FLEXPWM_SMCTRL_PRSC
+  #define FLEXPWM_SMCTRL_PRSC(n) ((n)&0x7)
+#endif
+
+struct FlexDump { uint32_t tctl, tcfg, tcmp, shiftctl, shiftcfg, sden; };
+enum class SinkMode : uint8_t { NONE=0, CRC=1, MEANRMS=2, DECIM=3 };
+
+static const char*  FW_VER = "P3_R0053_ARCH_SYNC64_R0002_HF5_HF3_fix6_TRG0_RST1";
+static const uint32_t FS_DEFAULT_HZ = 65536;
+static const uint32_t RUN_SEC_DEFAULT = 3;
+
+static constexpr uint8_t  PWIDTH_M1=1;                         // Dual SDO → 2bit
+static constexpr uint32_t TOKENS_PER_WORD = 32/(PWIDTH_M1+1);  // 16 tokens per word
+static constexpr uint32_t TOKENS_PER_FRAME = 64;               // 64 tokens per frame
+static constexpr uint32_t WORDS_PER_FRAME  = TOKENS_PER_FRAME / TOKENS_PER_WORD; // 4 words
+static constexpr uint8_t  QLEN=64, QMASK=QLEN-1;
+static constexpr uint32_t WORD_RING=65536;
+
+// ---- 상태 ----
+static volatile uint32_t g_rd_div_N=32, g_rd_fixed_hz=0, g_fs_req_hz=FS_DEFAULT_HZ;
+static volatile uint32_t g_convst_low_guard_cycles=2;
+static volatile bool     g_cfg_violation=false;
+
+DMAMEM __attribute__((aligned(32))) static volatile uint32_t g_ping[WORDS_PER_FRAME];
+DMAMEM __attribute__((aligned(32))) static volatile uint32_t g_pong[WORDS_PER_FRAME];
+
+static const volatile uint32_t* g_q_ptr[QLEN];
+static volatile uint32_t g_q_len[QLEN];
+static volatile uint8_t  g_q_head=0, g_q_tail=0;
+static volatile uint32_t g_q_drop=0;
+
+DMAMEM __attribute__((aligned(32))) static volatile uint32_t g_ring[WORD_RING];
+static volatile uint32_t g_r_head=0, g_r_tail=0, g_r_overrun=0;
+
+static volatile bool     g_capture_on=false;
+static uint32_t          g_run_ms_target=RUN_SEC_DEFAULT*1000U, g_run_ms_start=0;
+
+static volatile bool     g_use_ping=true;
+static volatile uint32_t g_shift_err_acc=0, g_shift_stat_acc=0, g_dma_isr_cnt=0;
+static volatile uint64_t g_total_words=0;
+
+static volatile uint64_t g_fs_irq_count=0;
+static volatile uint32_t g_dwt_hi=0, g_dwt_prev=0;
+static volatile uint64_t g_ts_first64=0, g_ts_last64=0;
+static volatile bool     g_ts_has_first=false;
+
+static volatile SinkMode g_sink_mode=SinkMode::NONE;
+static volatile uint32_t g_decim_k=4;
+static volatile uint32_t g_dsp_blocks=0, g_dsp_overrun=0, g_dsp_us_last=0, g_dsp_us_acc=0;
+static volatile uint32_t g_dsp_want_words=256;
+
+// ---- 유틸 ----
+static inline bool is_pow2(uint32_t v){ return v && ((v & (v-1))==0); }
+static bool parse_u32(const char* s,uint32_t &outv){ char*e=nullptr; unsigned long v=strtoul(s,&e,10); if(e==s) return false; outv=(uint32_t)v; return true; }
+
+static inline void dwt_init(){
+  ARM_DEMCR |= ARM_DEMCR_TRCENA;
+  ARM_DWT_CYCCNT=0; ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
+}
+
+// ---- 핀 MUX / PWM 동기 ----
+static inline void pins_mux_pwm_flexio(){
+  *portConfigRegister(4)=1;  // D4: PWM2_SM0 PWMA  (RD out)
+  *portConfigRegister(5)=1;  // D5: PWM2_SM1 PWMA  (BUSY/CONVST out, Low=창)
+  *portConfigRegister(6)=4;  // D6: FLEXIO2_10     (TRIG in)
+  *portConfigRegister(7)=4;  // D7: FLEXIO2_17     (DATA)
+  *portConfigRegister(8)=4;  // D8: FLEXIO2_16     (DATA)
+  *portConfigRegister(9)=4;  // D9: FLEXIO2_11     (SCLK in; RD feedback)
+}
+
+static inline void pwm2_apply_sync(uint32_t fs_hz, uint32_t rd_div_N, uint32_t low_tokens, uint32_t guard_cycles){
+  g_cfg_violation=false;
+  const uint32_t ipg = F_BUS_ACTUAL; if(rd_div_N<2) rd_div_N=2;
+  g_rd_div_N = rd_div_N; g_rd_fixed_hz = ipg / rd_div_N;
+
+  uint32_t fs_psc=0, fs_clk=ipg, fs_ticks=0;
+  if(fs_hz==0) fs_hz=1;
+  while(true){ fs_ticks = fs_clk / fs_hz; if(fs_ticks<=65535) break; if(fs_psc<7){ fs_psc++; fs_clk>>=1; } else break; }
+
+  const uint32_t rd_period = rd_div_N;
+  const uint32_t low_ticks_need = (low_tokens + guard_cycles) * rd_period;
+  if(fs_ticks <= low_ticks_need + 2){
+    IMXRT_FLEXPWM2.MCTRL=0; IMXRT_FLEXPWM2.OUTEN=0; g_cfg_violation=true;
+    double low_us=(double)low_ticks_need/ipg*1e6, tfs_us=1e6/(double)fs_hz;
+    Serial.printf("[CFG_ERR] 64×RD(+g)=%.3fus > T_FS=%.3fus (N=%lu RD=%lu FS=%lu PSC=%lu)\n",
+                  low_us,tfs_us,(unsigned long)rd_div_N,(unsigned long)g_rd_fixed_hz,(unsigned long)fs_hz,(unsigned long)fs_psc);
+    return;
+  }
+
+  // SM0: RD 50% duty
+  IMXRT_FLEXPWM2.SM[0].CTRL  = FLEXPWM_SMCTRL_FULL | FLEXPWM_SMCTRL_LDMOD;
+  IMXRT_FLEXPWM2.SM[0].INIT  = 0;
+  IMXRT_FLEXPWM2.SM[0].VAL1  = rd_period;
+  IMXRT_FLEXPWM2.SM[0].VAL2  = 0;
+  IMXRT_FLEXPWM2.SM[0].VAL3  = rd_period/2;
+
+  // SM1: BUSY Low 창 (FS 동기)
+  IMXRT_FLEXPWM2.SM[1].CTRL  = FLEXPWM_SMCTRL_FULL | FLEXPWM_SMCTRL_LDMOD | FLEXPWM_SMCTRL_PRSC(fs_psc);
+  IMXRT_FLEXPWM2.SM[1].INIT  = 0;
+  IMXRT_FLEXPWM2.SM[1].VAL1  = fs_ticks;       // period
+  IMXRT_FLEXPWM2.SM[1].VAL3  = low_ticks_need; // Low width = 64×RD + guard
+  IMXRT_FLEXPWM2.SM[1].OCTRL |= FLEXPWM_SMOCTRL_POLA; // BUSY=Low 창
+
+  IMXRT_FLEXPWM2.OUTEN = FLEXPWM_OUTEN_PWMA_EN((1<<0)|(1<<1));
+
+  // Reload IRQ
+  IMXRT_FLEXPWM2.SM[1].STS   = FLEXPWM_SMSTS_RF;
+  IMXRT_FLEXPWM2.SM[1].INTEN = FLEXPWM_SMINTEN_RIE;
+
+  uint16_t mask=(1<<0)|(1<<1);
+  IMXRT_FLEXPWM2.MCTRL |= FLEXPWM_MCTRL_CLDOK(mask);
+  IMXRT_FLEXPWM2.MCTRL |= FLEXPWM_MCTRL_LDOK(mask);
+  IMXRT_FLEXPWM2.MCTRL |= FLEXPWM_MCTRL_RUN(mask);
+
+  double low_need_us=(double)low_ticks_need/ipg*1e6;
+  double tfs_us=(double)fs_ticks/(double)(ipg>>fs_psc)*1e6;
+  Serial.printf("[SYNC] FS=%luHz (psc=%lu, ticks=%lu, Tfs≈%.3fus)  RD=%luHz(N=%lu)  low_min_for_64≈%.3fus\n",
+    (unsigned long)fs_hz,(unsigned long)fs_psc,(unsigned long)fs_ticks,tfs_us,
+    (unsigned long)g_rd_fixed_hz,(unsigned long)g_rd_div_N,low_need_us);
+}
+
+// ---- FLEXIO2: Level Gate (TRGSRC=0, TRGPOL=1, ENA=2, RST=1, DIS=2, DEC=2) ----
+static inline void flexio2_clk_on(){ CCM_CCGR3 |= CCM_CCGR3_FLEXIO2(CCM_CCGR_ON); }
+
+static inline void flexio2_common_shifter(){
+  IMXRT_FLEXIO2_S.SHIFTCFG[3] = FLEXIO_SHIFTCFG_PWIDTH(PWIDTH_M1) | FLEXIO_SHIFTCFG_SSTOP(0) | FLEXIO_SHIFTCFG_SSTART(0);
+  // TIMSEL(0)=Timer0, PINSEL(16)=DATA, SMOD(1)=Receive, PINCFG(0)=input
+  IMXRT_FLEXIO2_S.SHIFTCTL[3] = FLEXIO_SHIFTCTL_TIMSEL(0) | FLEXIO_SHIFTCTL_PINCFG(0) | FLEXIO_SHIFTCTL_PINSEL(16) | FLEXIO_SHIFTCTL_SMOD(1);
+}
+
+// ★★★ 최소 변경: TRGSRC 비트 미설정(=0, External), TIMRST=1 ★★★
+static inline void flexio2_timer0_64tokens_level_gate_TRG0_RST1(){
+  IMXRT_FLEXIO2_S.TIMCTL[0] =
+      FLEXIO_TIMCTL_PINCFG(0) |
+      FLEXIO_TIMCTL_PINSEL(11) |                 // RD in (D9)
+      FLEXIO_TIMCTL_TIMOD(FLEX_TIMER_MODE) |
+      FLEXIO_TIMCTL_TRGSEL(10) |                 // BUSY trigger (D6)
+      FLEXIO_TIMCTL_TRGPOL;                      // Active-Low (BUSY Low에서 Enable)
+      // TRGSRC 비트는 설정하지 않음 → 0 = External
+
+  IMXRT_FLEXIO2_S.TIMCFG[0] =
+      FLEXIO_TIMCFG_TIMOUT(0) |
+      FLEXIO_TIMCFG_TIMDEC(2)  |                 // RD edge 감소
+      FLEXIO_TIMCFG_TIMRST(1)  |                 // ★ Trigger에서 Reset
+      FLEXIO_TIMCFG_TIMENA(2)  |                 // ★ Trigger High Enable (TRGPOL=1 → BUSY Low)
+      FLEXIO_TIMCFG_TIMDIS(2);                   // Compare에서 Disable (64토큰 끝나면 정지)
+
+  IMXRT_FLEXIO2_S.TIMCMP[0] = 0x7F00;            // 128 edges → 64 RD clocks
+}
+
+static inline void flexio2_enable_and_dma(){
+  IMXRT_FLEXIO2_S.TIMSTAT   = 0xFF;  // W1C
+  IMXRT_FLEXIO2_S.SHIFTSTAT = 0xFF;
+  IMXRT_FLEXIO2_S.SHIFTERR  = 0xFF;
+
+  IMXRT_FLEXIO2_S.CTRL = FLEXIO_CTRL_DBGE | FLEXIO_CTRL_FLEXEN;
+  IMXRT_FLEXIO2_S.SHIFTSDEN = (1u<<3);          // DMA Enable (Shifter3)
+}
+
+static inline void flexio2_quiesce(){
+  IMXRT_FLEXIO2_S.SHIFTSDEN = 0;
+  IMXRT_FLEXIO2_S.SHIFTSTAT = 0xFF;
+  IMXRT_FLEXIO2_S.SHIFTERR  = 0xFF;
+  IMXRT_FLEXIO2_S.TIMSTAT   = 0xFF;
+}
+
+static inline FlexDump take_dump(){
+  return FlexDump{
+    IMXRT_FLEXIO2_S.TIMCTL[0], IMXRT_FLEXIO2_S.TIMCFG[0], IMXRT_FLEXIO2_S.TIMCMP[0],
+    IMXRT_FLEXIO2_S.SHIFTCTL[3], IMXRT_FLEXIO2_S.SHIFTCFG[3], IMXRT_FLEXIO2_S.SHIFTSDEN
+  };
+}
+static inline void print_dump(const char* tag, const FlexDump& d){
+  uint32_t trgsel=(d.tctl>>24)&0x3F, trgsrc=(d.tctl>>22)&0x1, trqpol=(d.tctl>>23)&0x1, pinsel=(d.tctl>>8)&0x1F;
+  uint32_t timout=(d.tcfg>>0)&0x3, timena=(d.tcfg>>8)&0x7, timdis=(d.tcfg>>12)&0x7, timrst=(d.tcfg>>16)&0x7, timdec=(d.tcfg>>20)&0x3;
+  Serial.printf("[%s] TIMCTL0=%08lX TRGSRC=%lu TRGPOL=%lu TRGSEL=%lu PINSEL=%lu  TIMCFG0=%08lX (OUT=%lu ENA=%lu DIS=%lu RST=%lu DEC=%lu)  TIMCMP0=%08lX\n",
+    tag,d.tctl,(unsigned long)trgsrc,(unsigned long)trqpol,(unsigned long)trgsel,(unsigned long)pinsel,
+    d.tcfg,(unsigned long)timout,(unsigned long)timena,(unsigned long)timdis,(unsigned long)timrst,(unsigned long)timdec,d.tcmp);
+  Serial.printf("[%s] SHIFTCTL3=%08lX SHIFTCFG3=%08lX SHIFTSDEN=%08lX\n", tag,d.shiftctl,d.shiftcfg,d.sden);
+}
+
+// ---- 링/큐/DMA ----
+static inline uint32_t ring_free_words(){ uint32_t h=g_r_head,t=g_r_tail; return (WORD_RING-1)-((h-t)&(WORD_RING-1)); }
+static inline uint32_t ring_avail_words(){ return (g_r_head - g_r_tail) & (WORD_RING-1); }
+static inline void ring_make_room(uint32_t need){ uint32_t f=ring_free_words(); if(f>=need) return; uint32_t drop=need-f; g_r_tail=(g_r_tail+drop)&(WORD_RING-1); g_r_overrun+=drop; }
+static inline void ring_push_words(const volatile uint32_t* p, uint32_t n){
+  ring_make_room(n);
+  for(uint32_t i=0;i<n;i++){ g_ring[g_r_head]=p[i]; g_r_head=(g_r_head+1)&(WORD_RING-1); }
+  g_total_words+=n;
+}
+static inline void q_push_isr(const volatile uint32_t* p, uint32_t n){
+  uint8_t nxt=(g_q_head+1)&QMASK; if(nxt==g_q_tail){ g_q_drop++; return; }
+  g_q_ptr[g_q_head]=p; g_q_len[g_q_head]=n; g_q_head=nxt;
+}
+static inline void pump_queue_to_ring(){
+  noInterrupts();
+  while(g_q_tail!=g_q_head){
+    const volatile uint32_t* p=g_q_ptr[g_q_tail]; uint32_t n=g_q_len[g_q_tail];
+    g_q_tail=(g_q_tail+1)&QMASK; interrupts(); ring_push_words(p,n); noInterrupts();
+  }
+  interrupts();
+}
+
+DMAChannel g_dma;
+static void dma_isr(){
+  g_dma.clearInterrupt();
+  if(!g_ts_has_first){ g_ts_has_first=true; g_ts_first64 = ((uint64_t)g_dwt_hi<<32) | ARM_DWT_CYCCNT; }
+  g_dma_isr_cnt++;
+
+  uint32_t st=IMXRT_FLEXIO2_S.SHIFTSTAT, er=IMXRT_FLEXIO2_S.SHIFTERR;
+  if(st){ g_shift_stat_acc|=st; IMXRT_FLEXIO2_S.SHIFTSTAT=st; }
+  if(er){ g_shift_err_acc |=er; IMXRT_FLEXIO2_S.SHIFTERR =er; }
+
+  if(g_use_ping){
+    q_push_isr(g_ping,WORDS_PER_FRAME);
+    g_dma.destinationBuffer((volatile unsigned int*)g_pong,WORDS_PER_FRAME);
+    g_use_ping=false;
+  }else{
+    q_push_isr(g_pong,WORDS_PER_FRAME);
+    g_dma.destinationBuffer((volatile unsigned int*)g_ping,WORDS_PER_FRAME);
+    g_use_ping=true;
+  }
+  g_dma.enable();
+}
+
+static inline void dma_start(){
+  g_dma.begin(true); g_dma.disable();
+  g_dma.source(IMXRT_FLEXIO2_S.SHIFTBUF[3]);
+  g_dma.triggerAtHardwareEvent(DMAMUX_SOURCE_FLEXIO2_REQUEST3);
+  g_dma.destinationBuffer((volatile unsigned int*)g_ping,WORDS_PER_FRAME);
+  g_use_ping=true;
+  g_dma.attachInterrupt(dma_isr);
+  g_dma.interruptAtCompletion();
+
+  IMXRT_FLEXIO2_S.SHIFTSDEN = (1u<<3);  // DMA Enable 재확인
+  g_dma.enable();
+
+  g_ts_has_first=false; g_fs_irq_count=0;
+}
+static inline void dma_stop(){ g_dma.disable(); g_dma.detachInterrupt(); }
+
+// ---- PRECHECK ----
+static uint32_t measure_rd_dwt_poll(uint8_t pin, uint32_t edges){
+  pinMode(pin, INPUT);
+  uint32_t prev=digitalReadFast(pin), cnt=0, t0=ARM_DWT_CYCCNT;
+  while(cnt<edges){ uint32_t v=digitalReadFast(pin); if(v!=prev){ if(v) cnt++; prev=v; } }
+  uint32_t dt=ARM_DWT_CYCCNT-t0; if(dt==0) dt=1;
+  return (uint32_t)(((double)F_CPU_ACTUAL*(double)edges)/(double)dt + 0.5);
+}
+static bool precheck(){
+  bool mux_ok=(((*portConfigRegister(4))&7)==1)&&(((*portConfigRegister(5))&7)==1)&&(((*portConfigRegister(6))&7)==4)&&(((*portConfigRegister(7))&7)==4)&&(((*portConfigRegister(8))&7)==4)&&(((*portConfigRegister(9))&7)==4);
+
+  uint32_t tctl=IMXRT_FLEXIO2_S.TIMCTL[0], tcfg=IMXRT_FLEXIO2_S.TIMCFG[0];
+  uint32_t trgsrc=(tctl>>22)&0x1, trqpol=(tctl>>23)&0x1, trgsel=(tctl>>24)&0x3F, pinsel=(tctl>>8)&0x1F;
+  uint32_t timout=(tcfg>>0)&0x3, timena=(tcfg>>8)&0x7, timdis=(tcfg>>12)&0x7, timrst=(tcfg>>16)&0x7, timdec=(tcfg>>20)&0x3;
+
+  bool flexen=(IMXRT_FLEXIO2_S.CTRL&FLEXIO_CTRL_FLEXEN)!=0;
+  bool dmaen=(IMXRT_FLEXIO2_S.SHIFTSDEN & (1u<<3))!=0;
+
+  const uint32_t EXP_TRGSEL=10, EXP_PINSEL=11;
+  bool flex_ok= flexen && dmaen &&
+               (trgsrc==0) &&            // ★ External
+               (trqpol==1) &&            // Active-Low (BUSY Low에서 Enable)
+               (trgsel==EXP_TRGSEL) &&
+               (pinsel==EXP_PINSEL) &&
+               (timout==0)&&(timena==2)&&(timdis==2)&&(timrst==1)&&(timdec==2);
+
+  uint32_t rd_meas=measure_rd_dwt_poll(9,4096);
+  bool rd_ok=(g_rd_fixed_hz>0) ? (abs((int32_t)rd_meas-(int32_t)g_rd_fixed_hz) < (int32_t)(g_rd_fixed_hz/20)) : false;
+
+  Serial.printf("[PRECHECK] mux=%s, flex=%s, RD=%s (req=%lu, meas≈%lu), SHIFTSDEN=%s, FS=req=%lu\n",
+    mux_ok?"OK":"FAIL", flex_ok?"OK":"FAIL", rd_ok?"OK":"WARN",
+    (unsigned long)g_rd_fixed_hz,(unsigned long)rd_meas, dmaen?"ON":"OFF", (unsigned long)g_fs_req_hz);
+
+  return (mux_ok && flex_ok && rd_ok);
+}
+
+// ---- 타임스탬프 ISR ----
+void flexpwm2_1_isr(void){
+  if(IMXRT_FLEXPWM2.SM[1].STS & FLEXPWM_SMSTS_RF){
+    uint32_t now=ARM_DWT_CYCCNT; if(now<g_dwt_prev) g_dwt_hi++; g_dwt_prev=now;
+    g_ts_last64=((uint64_t)g_dwt_hi<<32)|now; if(!g_ts_has_first){ g_ts_first64=g_ts_last64; g_ts_has_first=true; }
+    g_fs_irq_count++; IMXRT_FLEXPWM2.SM[1].STS=FLEXPWM_SMSTS_RF;
+  }
+}
+static inline void pwm2_irq_on(){ attachInterruptVector(IRQ_FLEXPWM2_1, flexpwm2_1_isr); NVIC_ENABLE_IRQ(IRQ_FLEXPWM2_1); }
+static inline void pwm2_irq_off(){ NVIC_DISABLE_IRQ(IRQ_FLEXPWM2_1); }
+
+// ---- 파이프라인 & KPI ----
+static inline void pwm2_on_boot(){ pwm2_apply_sync(g_fs_req_hz, g_rd_div_N, TOKENS_PER_FRAME, g_convst_low_guard_cycles); }
+
+static bool pipeline_start(uint32_t sec){
+  pins_mux_pwm_flexio();
+  flexio2_clk_on();
+  flexio2_common_shifter();
+  flexio2_timer0_64tokens_level_gate_TRG0_RST1();
+  flexio2_enable_and_dma();
+
+  dwt_init(); pwm2_irq_on(); pwm2_on_boot();
+  if(g_cfg_violation){ Serial.println("[SMSTART] 중지: 64×RD(+guard) ≤ FS 불만족"); return false; }
+
+  g_q_head=g_q_tail=0; g_r_head=g_r_tail=0; g_total_words=0; g_q_drop=0; g_r_overrun=0;
+  g_shift_err_acc=0; g_shift_stat_acc=0; g_dma_isr_cnt=0;
+  g_ts_has_first=false; g_fs_irq_count=0; g_dwt_hi=0; g_dwt_prev=ARM_DWT_CYCCNT; g_ts_first64=0; g_ts_last64=0;
+  g_dsp_blocks=0; g_dsp_overrun=0; g_dsp_us_last=0; g_dsp_us_acc=0;
+
+  dma_start();
+
+  Serial.printf("[SMSTART] ver=%s  FS=%lu  RD=%lu(N=%lu)  block=%lu words(=%lu frames)\n",
+    FW_VER,(unsigned long)g_fs_req_hz,(unsigned long)g_rd_fixed_hz,(unsigned long)g_rd_div_N,
+    (unsigned long)g_dsp_want_words,(unsigned long)(g_dsp_want_words/WORDS_PER_FRAME));
+  print_dump("DUMP@START", take_dump());
+
+  g_capture_on=true; g_run_ms_target=sec*1000U; g_run_ms_start=millis();
+  return true;
+}
+
+static void pipeline_stop(){
+  if(!g_capture_on){ Serial.println("[SMSTOP] capture_off"); return; }
+  g_capture_on=false;
+
+  dma_stop(); pwm2_irq_off(); flexio2_quiesce();
+  pump_queue_to_ring();
+  print_dump("DUMP@END", take_dump());
+
+  const uint32_t F=g_dma_isr_cnt;
+  double t_win=0.0;
+  if(g_ts_has_first){ t_win=(double)(g_ts_last64 - g_ts_first64)/(double)F_CPU_ACTUAL; }
+
+  const double fs_eff_dma   = (t_win>0.0 && F>0) ? ((double)F / t_win) : 0.0;
+  const double frames_words = (double)g_total_words / (double)WORDS_PER_FRAME;
+  const double fs_eff_words = (t_win>0.0 && frames_words>0.0) ? (frames_words / t_win) : 0.0;
+  const double fs_eff_irq   = (t_win>0.0 && g_fs_irq_count>0) ? ((double)g_fs_irq_count / t_win) : 0.0;
+
+  Serial.println("[SMSTOP] KPI");
+  Serial.printf("  frames(DMA)=%lu, words_total=%llu, frames_from_words=%.0f\n",
+    (unsigned long)F,(unsigned long long)g_total_words, frames_words);
+  Serial.printf("  t_win=%.6fs\n", t_win);
+  Serial.printf("  f_eff(DMA)=%.6f | f_eff(words)=%.6f | f_eff(capture)=%.6f\n",
+    fs_eff_dma, fs_eff_words, fs_eff_irq);
+  Serial.printf("  SHIFTSTAT_ACC=0x%08lX, SHIFTERR_ACC=0x%08lX, SHIFTSDEN=0x%08lX\n",
+    (unsigned long)g_shift_stat_acc,(unsigned long)g_shift_err_acc,(unsigned long)(IMXRT_FLEXIO2_S.SHIFTSDEN));
+  if((double)F != frames_words){
+    Serial.printf("[ASSERT] frames_from_words(%.0f) != frames(DMA)(%lu)  → 프레임 보장 위배/미수집 의심\n",
+      frames_words, (unsigned long)F);
+  }
+  Serial.println("[END]");
+}
+
+// ---- 명령 ----
+static void handle_cmd(char* line){
+  if(!strncmp(line,"PRECHECK",8)){ (void)precheck(); return; }
+  if(!strncmp(line,"SMSTART",7)){ uint32_t t=RUN_SEC_DEFAULT; (void)parse_u32(line+7,t); (void)pipeline_start(t); return; }
+  if(!strncmp(line,"SMSTOP",6)){ pipeline_stop(); return; }
+
+  if(!strncmp(line,"SETFS",5)){
+    uint32_t v=0; if(parse_u32(line+5,v)&&v>=1){
+      g_fs_req_hz=v; pwm2_apply_sync(g_fs_req_hz,g_rd_div_N,TOKENS_PER_FRAME,g_convst_low_guard_cycles);
+      Serial.printf("[SETFS] FS=%luHz  RD=%luHz(N=%lu)\n",(unsigned long)g_fs_req_hz,(unsigned long)g_rd_fixed_hz,(unsigned long)g_rd_div_N);
+    } else Serial.println("[SETFS] SETFS <Hz>");
+    return;
+  }
+  if(!strncmp(line,"SETRDIV",7)){
+    uint32_t N=0; if(parse_u32(line+7,N)&&N>=2&&N<=300){
+      g_rd_div_N=N; pwm2_apply_sync(g_fs_req_hz,g_rd_div_N,TOKENS_PER_FRAME,g_convst_low_guard_cycles);
+      Serial.printf("[SETRDIV] N=%lu → RD=%luHz  FS_max≈%luHz\n",
+        (unsigned long)g_rd_div_N,(unsigned long)g_rd_fixed_hz,(unsigned long)(g_rd_fixed_hz/64));
+    } else Serial.println("[SETRDIV] SETRDIV <N=2..300>");
+    return;
+  }
+  if(!strncmp(line,"SETBLK",6)){
+    uint32_t samples=0; if(parse_u32(line+6,samples)&&is_pow2(samples)){
+      uint32_t words=samples/TOKENS_PER_WORD;
+      if(words>=32&&words<=1024&&(words%WORDS_PER_FRAME)==0){ g_dsp_want_words=words;
+        Serial.printf("[SETBLK] samples=2^? → block=%lu words(=%lu frames)\n",
+          (unsigned long)g_dsp_want_words,(unsigned long)(g_dsp_want_words/WORDS_PER_FRAME)); }
+      else Serial.println("[SETBLK] words 32..1024 & 4의 배수 필요");
+    } else Serial.println("[SETBLK] SETBLK <2^M>");
+    return;
+  }
+
+  Serial.println("[ERR] 알 수 없는 명령");
+}
+
+// ---- Arduino ----
+void setup(){
+  Serial.begin(2000000); while(!Serial && millis()<2000){}
+  Serial.printf("[%s] READY. cmds: PRECHECK, SMSTART <sec>, SMSTOP, SETFS <Hz>, SETRDIV <N>, SETBLK <2^M>\n", FW_VER);
+
+  pins_mux_pwm_flexio();
+  flexio2_clk_on();
+  flexio2_common_shifter();
+  flexio2_timer0_64tokens_level_gate_TRG0_RST1();
+  flexio2_enable_and_dma();
+  dwt_init(); pwm2_irq_on();
+  pwm2_on_boot();
+
+  Serial.printf("[SYNC] FS=%luHz (RD=%luHz,N=%lu)\n",(unsigned long)g_fs_req_hz,(unsigned long)g_rd_fixed_hz,(unsigned long)g_rd_div_N);
+  print_dump("DUMP@BOOT", take_dump());
+}
+
+void loop(){
+  static char buf[64]; static uint8_t idx=0;
+  while(Serial.available()){
+    char c=(char)Serial.read();
+    if(c=='\r'||c=='\n'){ buf[idx]=0; if(idx){ for(uint8_t i=0;i<idx;i++) buf[i]=(char)toupper((unsigned char)buf[i]); handle_cmd(buf);} idx=0; }
+    else if(idx<sizeof(buf)-1) buf[idx++]=c;
+  }
+  if(g_capture_on){
+    pump_queue_to_ring();
+    if((millis()-g_run_ms_start)>=g_run_ms_target) pipeline_stop();
+  }
+}
